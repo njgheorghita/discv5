@@ -999,22 +999,44 @@ impl Handler {
                         "Message from node: {} is not encrypted with known session keys.",
                         node_address
                     );
-                    self.fail_session(&node_address, RequestError::InvalidRemotePacket, true)
-                        .await;
-                    // If we haven't already sent a WhoAreYou,
-                    // spawn a WHOAREYOU event to check for highest known ENR
-                    if self.active_challenges.get(&node_address).is_none() {
-                        let whoareyou_ref = WhoAreYouRef(node_address, message_nonce);
-                        if let Err(e) = self
-                            .service_send
-                            .send(HandlerOut::WhoAreYou(whoareyou_ref))
-                            .await
-                        {
-                            warn!("Failed to send WhoAreYou to the service {}", e)
+                    if let Some((_, request_call)) =
+                        self.active_requests.remove_by_nonce(&message_nonce)
+                    {
+                        match request_call.id() {
+                            HandlerReqId::Internal(_) => {
+                                // Do not report failures on requests belonging to the handler.
+                            }
+                            HandlerReqId::External(id) => {
+                                if let Err(e) = self
+                                    .service_send
+                                    .send(HandlerOut::RequestFailed(
+                                        id.clone(),
+                                        RequestError::InvalidRemotePacket,
+                                    ))
+                                    .await
+                                {
+                                    warn!("Failed to inform request failure {}", e)
+                                }
+                            }
                         }
-                    } else {
-                        trace!("WHOAREYOU packet already sent: {}", node_address);
                     }
+
+                    //self.fail_session(&node_address, RequestError::InvalidRemotePacket, true)
+                    //.await;
+                    //// If we haven't already sent a WhoAreYou,
+                    //// spawn a WHOAREYOU event to check for highest known ENR
+                    //if self.active_challenges.get(&node_address).is_none() {
+                    //let whoareyou_ref = WhoAreYouRef(node_address, message_nonce);
+                    //if let Err(e) = self
+                    //.service_send
+                    //.send(HandlerOut::WhoAreYou(whoareyou_ref))
+                    //.await
+                    //{
+                    //warn!("Failed to send WhoAreYou to the service {}", e)
+                    //}
+                    //} else {
+                    //trace!("WHOAREYOU packet already sent: {}", node_address);
+                    //}
                     return;
                 }
             };
