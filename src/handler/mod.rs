@@ -1282,6 +1282,7 @@ impl Handler {
                 }
             }
         }
+        self.remove_expected_response(node_address.socket_addr);
     }
 
     /// Sends a packet to the send handler to be encoded and sent.
