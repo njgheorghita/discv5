@@ -27,9 +27,9 @@
 //! Messages from a node on the network come by [`Socket`] and get the form of a [`HandlerOut`]
 //! and can be forwarded to the application layer via the send channel.
 use crate::{
-    config::Discv5Config,
+    config::Config,
     discv5::PERMIT_BAN_LIST,
-    error::{Discv5Error, RequestError},
+    error::{Error, RequestError},
     packet::{ChallengeData, IdNonce, MessageNonce, Packet, PacketKind, ProtocolIdentity},
     rpc::{Message, Request, RequestBody, RequestId, Response, ResponseBody},
     socket,
@@ -231,7 +231,7 @@ impl Handler {
     pub async fn spawn<P: ProtocolIdentity>(
         enr: Arc<RwLock<Enr>>,
         key: Arc<RwLock<CombinedKey>>,
-        config: Discv5Config,
+        config: Config,
     ) -> Result<HandlerReturn, std::io::Error> {
         let (exit_sender, exit) = oneshot::channel();
         // create the channels to send/receive messages from the application
@@ -800,6 +800,8 @@ impl Handler {
                 enr_record,
             ) {
                 Ok((mut session, enr)) => {
+                    // Remove the expected response for the challenge.
+                    self.remove_expected_response(node_address.socket_addr);
                     // Receiving an AuthResponse must give us an up-to-date view of the node ENR.
                     // Verify the ENR is valid
                     if self.verify_enr(&enr, &node_address) {
@@ -877,7 +879,7 @@ impl Handler {
                         }
                     }
                 }
-                Err(Discv5Error::InvalidChallengeSignature(challenge)) => {
+                Err(Error::InvalidChallengeSignature(challenge)) => {
                     warn!(
                         "Authentication header contained invalid signature. Ignoring packet from: {}",
                         node_address
