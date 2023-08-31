@@ -694,6 +694,7 @@ impl Handler {
         // All sent requests must have an associated node_id. Therefore the following
         // must not panic.
         let node_address = request_call.contact().node_address();
+        let auth_message_nonce = auth_packet.header.message_nonce;
         match request_call.contact().enr() {
             Some(enr) => {
                 // NOTE: Here we decide if the session is outgoing or ingoing. The condition for an
@@ -707,7 +708,11 @@ impl Handler {
                 };
 
                 // We already know the ENR. Send the handshake response packet
-                trace!("Sending Authentication response to node: {}", node_address);
+                trace!(
+                    "Sending Authentication response to node: {} ({:?})",
+                    node_address,
+                    request_call.id()
+                );
                 request_call.update_packet(auth_packet.clone());
                 request_call.set_handshake_sent();
                 request_call.set_initiating_session(false);
@@ -731,7 +736,11 @@ impl Handler {
 
                 // Send the Auth response
                 let contact = request_call.contact().clone();
-                trace!("Sending Authentication response to node: {}", node_address);
+                trace!(
+                    "Sending Authentication response to node: {} ({:?})",
+                    node_address,
+                    request_call.id()
+                );
                 request_call.update_packet(auth_packet.clone());
                 request_call.set_handshake_sent();
                 // Reinsert the request_call
@@ -749,7 +758,7 @@ impl Handler {
                 }
             }
         }
-        self.new_session::<P>(node_address, session, Some(request_nonce))
+        self.new_session::<P>(node_address, session, Some(auth_message_nonce))
             .await;
     }
 
@@ -940,16 +949,31 @@ impl Handler {
         node_address: &NodeAddress,
         message_nonce: Option<MessageNonce>,
     ) {
-        let active_requests = self
-            .active_requests
-            .remove_requests(node_address)
-            .unwrap_or_default()
-            .into_iter()
-            // Skip the active request that was used to establish the new session,
-            // as it has already been handled and shouldn't be replayed.
-            .filter(|req| Some(*req.packet().message_nonce()) != message_nonce);
+        trace!(
+            "Replaying active requests. {}, {:?}",
+            node_address,
+            message_nonce
+        );
+        let active_requests = if let Some(nonce) = message_nonce {
+            // Except the active request that was used to establish the new session, as it has
+            // already been handled and shouldn't be replayed.
+            self.active_requests
+                .remove_requests_except(node_address, &nonce)
+        } else {
+            self.active_requests.remove_requests(node_address)
+        }
+        .unwrap_or_default();
         for req in active_requests {
             let (req_id, contact, body) = req.into_request_parts();
+            trace!(
+                "Active request to be replayed. {:?}, {}, {}",
+                req_id,
+                contact,
+                body
+            );
+            // Remove the request from the packet filter here since the request is added in
+            // `self.send_request()` again.
+            self.remove_expected_response(contact.socket_addr());
             if let Err(request_error) = self.send_request::<P>(contact, req_id.clone(), body).await
             {
                 warn!("Failed to send next awaiting request {request_error}");

@@ -7,7 +7,11 @@ use crate::{
     rpc::{Request, Response},
     ConfigBuilder, IpMode,
 };
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    collections::HashSet,
+    net::{Ipv4Addr, Ipv6Addr},
+    ops::Add,
+};
 
 use crate::{
     handler::{session::build_dummy_session, HandlerOut::RequestFailed},
@@ -397,6 +401,34 @@ async fn test_active_requests_remove_requests() {
 }
 
 #[tokio::test]
+async fn test_active_requests_remove_requests_except() {
+    const EXPIRY: Duration = Duration::from_secs(5);
+    let mut active_requests = ActiveRequests::new(EXPIRY);
+
+    let node_1 = create_node();
+    let node_2 = create_node();
+    let (req_1, req_1_addr) = create_req_call(&node_1);
+    let (req_2, req_2_addr) = create_req_call(&node_2);
+    let (req_3, req_3_addr) = create_req_call(&node_2);
+
+    let req_2_nonce = req_2.packet().header.message_nonce.clone();
+    let req_3_id: RequestId = req_3.id().into();
+
+    active_requests.insert(req_1_addr, req_1);
+    active_requests.insert(req_2_addr.clone(), req_2);
+    active_requests.insert(req_3_addr, req_3);
+
+    let removed_requests = active_requests
+        .remove_requests_except(&req_2_addr, &req_2_nonce)
+        .unwrap();
+    active_requests.check_invariant();
+
+    assert_eq!(1, removed_requests.len());
+    let removed_request_id: RequestId = removed_requests.first().unwrap().id().into();
+    assert_eq!(removed_request_id, req_3_id);
+}
+
+#[tokio::test]
 async fn test_active_requests_remove_request() {
     const EXPIRY: Duration = Duration::from_secs(5);
     let mut active_requests = ActiveRequests::new(EXPIRY);
@@ -592,4 +624,224 @@ async fn remove_one_time_session() {
         .remove_one_time_session(&node_address, &request_id)
         .is_some());
     assert_eq!(0, handler.one_time_sessions.len());
+}
+
+// Tests replaying active requests.
+//
+// In this test, Receiver's session expires and Receiver returns WHOAREYOU.
+// Sender then creates a new session and resend active requests.
+//
+// ```mermaid
+// sequenceDiagram
+//     participant Sender
+//     participant Receiver
+//     Note over Sender: Start discv5 server
+//     Note over Receiver: Start discv5 server
+//
+//     Note over Sender,Receiver: Session established
+//
+//     rect rgb(100, 100, 0)
+//     Note over Receiver: ** Session expired **
+//     end
+//
+//     rect rgb(10, 10, 10)
+//     Note left of Sender: Sender sends requests <br> **in parallel**.
+//     par
+//     Sender ->> Receiver: PING(id:2)
+//     and
+//     Sender -->> Receiver: PING(id:3)
+//     and
+//     Sender -->> Receiver: PING(id:4)
+//     and
+//     Sender -->> Receiver: PING(id:5)
+//     end
+//     end
+//
+//     Note over Receiver: Send WHOAREYOU<br>since the session has been expired
+//     Receiver ->> Sender: WHOAREYOU
+//
+//     rect rgb(100, 100, 0)
+//     Note over Receiver: Drop PING(id:2,3,4,5) request<br>since WHOAREYOU already sent.
+//     end
+//
+//     Note over Sender: New session established with Receiver
+//
+//     Sender ->> Receiver: Handshake message (id:2)
+//
+//     Note over Receiver: New session established with Sender
+//
+//     rect rgb(10, 10, 10)
+//     Note left of Sender: Handler::replay_active_requests()
+//     Sender ->> Receiver: PING (id:3)
+//     Sender ->> Receiver: PING (id:4)
+//     Sender ->> Receiver: PING (id:5)
+//     end
+//
+//     Receiver ->> Sender: PONG (id:2)
+//     Receiver ->> Sender: PONG (id:3)
+//     Receiver ->> Sender: PONG (id:4)
+//     Receiver ->> Sender: PONG (id:5)
+// ```
+#[tokio::test]
+async fn test_replay_active_requests() {
+    init();
+    let sender_port = 5004;
+    let receiver_port = 5005;
+    let ip = "127.0.0.1".parse().unwrap();
+    let key1 = CombinedKey::generate_secp256k1();
+    let key2 = CombinedKey::generate_secp256k1();
+
+    let sender_enr = EnrBuilder::new("v4")
+        .ip4(ip)
+        .udp4(sender_port)
+        .build(&key1)
+        .unwrap();
+
+    let receiver_enr = EnrBuilder::new("v4")
+        .ip4(ip)
+        .udp4(receiver_port)
+        .build(&key2)
+        .unwrap();
+
+    // Build sender handler
+    let (sender_exit, sender_send, mut sender_recv, mut handler) = {
+        let sender_listen_config = ListenConfig::Ipv4 {
+            ip: sender_enr.ip4().unwrap(),
+            port: sender_enr.udp4().unwrap(),
+        };
+        let sender_config = ConfigBuilder::new(sender_listen_config).build();
+        build_handler::<DefaultProtocolId>(sender_enr.clone(), key1, sender_config).await
+    };
+    let sender = async move {
+        // Start sender handler.
+        handler.start::<DefaultProtocolId>().await;
+        // After the handler has been terminated test the handler's states.
+        assert!(handler.pending_requests.is_empty());
+        assert_eq!(0, handler.active_requests.count().await);
+        assert!(handler.active_challenges.is_empty());
+        assert!(handler.filter_expected_responses.read().is_empty());
+    };
+
+    // Build receiver handler
+    // Shorten receiver's timeout to reproduce session expired.
+    let receiver_session_timeout = Duration::from_secs(1);
+    let (receiver_exit, receiver_send, mut receiver_recv, mut handler) = {
+        let receiver_listen_config = ListenConfig::Ipv4 {
+            ip: receiver_enr.ip4().unwrap(),
+            port: receiver_enr.udp4().unwrap(),
+        };
+        let receiver_config = ConfigBuilder::new(receiver_listen_config)
+            .session_timeout(receiver_session_timeout.clone())
+            .build();
+        build_handler::<DefaultProtocolId>(receiver_enr.clone(), key2, receiver_config).await
+    };
+    let receiver = async move {
+        // Start receiver handler.
+        handler.start::<DefaultProtocolId>().await;
+        // After the handler has been terminated test the handler's states.
+        assert!(handler.pending_requests.is_empty());
+        assert_eq!(0, handler.active_requests.count().await);
+        assert!(handler.active_challenges.is_empty());
+        assert!(handler.filter_expected_responses.read().is_empty());
+    };
+
+    let messages_to_send = 5usize;
+
+    let sender_ops = async move {
+        let mut response_count = 0usize;
+        let mut expected_request_ids = HashSet::new();
+        expected_request_ids.insert(RequestId(vec![1]));
+
+        // sender to send the first message then await for the session to be established
+        let _ = sender_send.send(HandlerIn::Request(
+            receiver_enr.clone().into(),
+            Box::new(Request {
+                id: RequestId(vec![1]),
+                body: RequestBody::Ping { enr_seq: 1 },
+            }),
+        ));
+
+        match sender_recv.recv().await {
+            Some(HandlerOut::Established(_, _, _)) => {
+                // Sleep until receiver's session expired.
+                tokio::time::sleep(receiver_session_timeout.add(Duration::from_millis(500))).await;
+                // send the rest of the messages
+                for req_id in 2..=messages_to_send {
+                    let request_id = RequestId(vec![req_id as u8]);
+                    expected_request_ids.insert(request_id.clone());
+                    let _ = sender_send.send(HandlerIn::Request(
+                        receiver_enr.clone().into(),
+                        Box::new(Request {
+                            id: request_id,
+                            body: RequestBody::Ping { enr_seq: 1 },
+                        }),
+                    ));
+                }
+            }
+            handler_out => panic!("Unexpected message: {:?}", handler_out),
+        }
+
+        loop {
+            match sender_recv.recv().await {
+                Some(HandlerOut::Response(_, response)) => {
+                    assert!(expected_request_ids.remove(&response.id));
+                    response_count += 1;
+                    if response_count == messages_to_send {
+                        // Notify the handlers that the message exchange has been completed.
+                        assert!(expected_request_ids.is_empty());
+                        sender_exit.send(()).unwrap();
+                        receiver_exit.send(()).unwrap();
+                        return;
+                    }
+                }
+                _ => continue,
+            };
+        }
+    };
+
+    let receiver_ops = async move {
+        let mut message_count = 0usize;
+        loop {
+            match receiver_recv.recv().await {
+                Some(HandlerOut::WhoAreYou(wru_ref)) => {
+                    receiver_send
+                        .send(HandlerIn::WhoAreYou(wru_ref, Some(sender_enr.clone())))
+                        .unwrap();
+                }
+                Some(HandlerOut::Request(addr, request)) => {
+                    assert!(matches!(request.body, RequestBody::Ping { .. }));
+                    let pong_response = Response {
+                        id: request.id,
+                        body: ResponseBody::Pong {
+                            enr_seq: 1,
+                            ip: ip.into(),
+                            port: sender_port,
+                        },
+                    };
+                    receiver_send
+                        .send(HandlerIn::Response(addr, Box::new(pong_response)))
+                        .unwrap();
+                    message_count += 1;
+                    if message_count == messages_to_send {
+                        return;
+                    }
+                }
+                _ => {
+                    continue;
+                }
+            }
+        }
+    };
+
+    let sleep_future = sleep(Duration::from_secs(5));
+    let message_exchange = async move {
+        let _ = tokio::join!(sender, sender_ops, receiver, receiver_ops);
+    };
+
+    tokio::select! {
+        _ = message_exchange => {}
+        _ = sleep_future => {
+            panic!("Test timed out");
+        }
+    }
 }
