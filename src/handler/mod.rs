@@ -473,8 +473,11 @@ impl Handler {
             return Err(RequestError::SelfRequest);
         }
 
-        // If there is already an active challenge (WHOAREYOU sent) for this node, add to pending requests
-        if self.active_challenges.get(&node_address).is_some() {
+        // If there is already an active challenge (WHOAREYOU sent) for this node, or if we are
+        // awaiting a session with this node to be established, add the request to pending requests.
+        if self.active_challenges.get(&node_address).is_some()
+            || self.is_awaiting_session_to_be_established(&node_address)
+        {
             trace!("Request queued for node: {}", node_address);
             self.pending_requests
                 .entry(node_address)
@@ -758,7 +761,7 @@ impl Handler {
                 }
             }
         }
-        self.new_session::<P>(node_address, session, Some(auth_message_nonce))
+        self.new_session::<P>(node_address.clone(), session, Some(auth_message_nonce))
             .await;
     }
 
@@ -841,9 +844,6 @@ impl Handler {
                             authenticated_data,
                         )
                         .await;
-                        // We could have pending messages that were awaiting this session to be
-                        // established. If so process them.
-                        self.send_pending_requests::<P>(&node_address).await;
                     } else {
                         // IP's or NodeAddress don't match. Drop the session.
                         warn!(
@@ -919,6 +919,11 @@ impl Handler {
             .remove(node_address)
             .unwrap_or_default();
         for req in pending_requests {
+            trace!(
+                "Sending pending request {} to {node_address}. {}",
+                RequestId::from(&req.request_id),
+                req.request,
+            );
             if let Err(request_error) = self
                 .send_request::<P>(req.contact, req.request_id.clone(), req.request)
                 .await
@@ -966,10 +971,8 @@ impl Handler {
         for req in active_requests {
             let (req_id, contact, body) = req.into_request_parts();
             trace!(
-                "Active request to be replayed. {:?}, {}, {}",
-                req_id,
-                contact,
-                body
+                "Active request to be replayed. {}, {contact}, {body}",
+                RequestId::from(&req_id),
             );
             // Remove the request from the packet filter here since the request is added in
             // `self.send_request()` again.
@@ -1216,10 +1219,13 @@ impl Handler {
             self.replay_active_requests::<P>(&node_address, message_nonce)
                 .await;
         } else {
-            self.sessions.insert(node_address, session);
+            self.sessions.insert(node_address.clone(), session);
             METRICS
                 .active_sessions
                 .store(self.sessions.len(), Ordering::Relaxed);
+            // We could have pending messages that were awaiting this session to be
+            // established. If so process them.
+            self.send_pending_requests::<P>(&node_address).await;
         }
     }
 
@@ -1347,5 +1353,20 @@ impl Handler {
             .write()
             .ban_nodes
             .retain(|_, time| time.is_none() || Some(Instant::now()) < *time);
+    }
+
+    /// Returns whether a session with this node does not exist and a request that initiates
+    /// a session has been sent.
+    fn is_awaiting_session_to_be_established(&mut self, node_address: &NodeAddress) -> bool {
+        if self.sessions.get(node_address).is_some() {
+            // session exists
+            return false;
+        }
+
+        if let Some(requests) = self.active_requests.get(node_address) {
+            requests.iter().any(|req| req.initiating_session())
+        } else {
+            false
+        }
     }
 }
