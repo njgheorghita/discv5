@@ -174,7 +174,7 @@ async fn test_connection_direction_on_inject_session_established() {
     let ip = std::net::Ipv4Addr::LOCALHOST;
     let enr = EnrBuilder::new("v4")
         .ip4(ip)
-        .udp4(10001)
+        .udp4(10003)
         .build(&enr_key1)
         .unwrap();
 
@@ -182,7 +182,7 @@ async fn test_connection_direction_on_inject_session_established() {
     let ip2 = std::net::Ipv4Addr::LOCALHOST;
     let enr2 = EnrBuilder::new("v4")
         .ip4(ip2)
-        .udp4(10002)
+        .udp4(10004)
         .build(&enr_key2)
         .unwrap();
 
@@ -232,7 +232,7 @@ async fn test_handling_concurrent_responses() {
         let enr_key = keypairs.pop().unwrap();
         let enr = EnrBuilder::new("v4")
             .ip4("127.0.0.1".parse().unwrap())
-            .udp4(10001)
+            .udp4(10005)
             .build(&enr_key)
             .unwrap();
         build_service::<DefaultProtocolId>(
@@ -245,7 +245,7 @@ async fn test_handling_concurrent_responses() {
 
     let node_contact: NodeContact = EnrBuilder::new("v4")
         .ip4("127.0.0.1".parse().unwrap())
-        .udp4(10002)
+        .udp4(10006)
         .build(&keypairs.remove(0))
         .unwrap()
         .into();
@@ -284,7 +284,7 @@ async fn test_handling_concurrent_responses() {
         .map(|(i, key)| {
             EnrBuilder::new("v4")
                 .ip4("127.0.0.1".parse().unwrap())
-                .udp4(10003 + i as u16)
+                .udp4(10007 + i as u16)
                 .build(key)
                 .unwrap()
         })
